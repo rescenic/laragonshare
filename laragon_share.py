@@ -31,6 +31,8 @@ DEFAULT_SITES_DIR = r"D:\laragon\etc\apache2\sites-enabled"
 LARAGON_NGROK = r"D:\laragon\bin\ngrok\ngrok.exe"
 TIMEOUT = 15
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# ngrok logs these at error level on every start (e.g. when launched through a Scoop shim); they aren't failures.
+BENIGN_NGROK_ERRORS = ("binary path for symlinks",)
 # Names that usually mean a DB admin UI or similar; sharing one gets an extra confirmation.
 RISKY_NAME = re.compile(r"(^|[-.])(db|pma|phpmyadmin|adminer|admin)([-.]|$)", re.I)
 
@@ -171,7 +173,7 @@ def ngrok_version(exe):
 
 
 class NgrokSession:
-    """One `ngrok http` agent process. Free accounts get one dev domain, so the app runs one at a time."""
+    """One `ngrok http` agent process for one vhost. Each share runs its own agent, so they stop independently."""
 
     def __init__(self, exe, vhost, scheme, post):
         self.vhost, self.scheme, self.post = vhost, scheme, post
@@ -180,6 +182,7 @@ class NgrokSession:
         self.url = None
         self.web_addr = None
         self.last_error = ""
+        self.stopping = False  # set by stop(), so the exit that follows isn't reported as a failure
         self.proc = subprocess.Popen(
             self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
@@ -195,7 +198,7 @@ class NgrokSession:
             try:
                 rec = json.loads(line)
             except ValueError:
-                self.post("log", line)
+                self.post("log", f"[{self.vhost}] {line}")
                 if "ERR_NGROK" in line or line.upper().startswith("ERROR"):
                     self.last_error = line
                 continue
@@ -208,16 +211,18 @@ class NgrokSession:
         rec = {k: v for k, v in rec.items() if "token" not in k.lower()}
         lvl, msg = rec.pop("lvl", "info"), rec.pop("msg", "")
         rec.pop("t", None)
-        if lvl in ("eror", "error", "crit") or "err" in rec:
-            self.last_error = str(rec.get("err") or msg)
+        if any(b in msg for b in BENIGN_NGROK_ERRORS):
+            return
+        if lvl in ("eror", "error", "crit"):
+            self.last_error = f"{msg}: {rec['err']}" if rec.get("err") else msg
         if msg == "starting web service" and rec.get("addr"):
             self.web_addr = rec["addr"]
         url = rec.get("url")
         if isinstance(url, str) and url.startswith("https://") and not self.url:
             self.url = url
             self.post("url", (self, url))
-        extras = " ".join(f"{k}={v}" for k, v in rec.items() if k not in ("obj", "pg", "id"))
-        self.post("log", f"[{lvl}] {msg} {extras}".rstrip())
+        extras = " ".join(f"{k}={v}" for k, v in rec.items() if k not in ("obj", "pg", "id") and v is not None)
+        self.post("log", f"[{self.vhost}] [{lvl}] {msg} {extras}".rstrip())
 
     def _api_fallback(self):
         """If the log never names the URL, ask this agent's own inspection API (4040, 4041, ...)."""
@@ -239,6 +244,7 @@ class NgrokSession:
                     return
 
     def stop(self):
+        self.stopping = True
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -259,7 +265,8 @@ class App(tk.Tk):
         self.minsize(760, 520)
         self.events = queue.Queue()
         self.vhosts = {}
-        self.session = None
+        self.sessions = {}    # site -> NgrokSession
+        self.pending = set()  # sites whose pre-share local check is still running
         self.ngrok = find_ngrok()
 
         self.sites_dir = tk.StringVar(value=sites_dir)
@@ -294,9 +301,9 @@ class App(tk.Tk):
         frow.pack(fill="x", pady=(0, 4))
         ttk.Label(frow, text="Filter:").pack(side="left")
         ttk.Entry(frow, textvariable=self.filter).pack(side="left", fill="x", expand=True, padx=4)
-        cols = ("site", "ports", "local", "target")
+        cols = ("site", "ports", "local", "shared", "target")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
-        for c, w in zip(cols, (190, 70, 110, 260)):
+        for c, w in zip(cols, (170, 70, 80, 230, 200)):
             self.tree.heading(c, text=c.capitalize())
             self.tree.column(c, width=w, stretch=c == "target")
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
@@ -323,7 +330,8 @@ class App(tk.Tk):
         self.btn_check = ttk.Button(btns, text="Check locally", command=self.check_local)
         self.btn_share = ttk.Button(btns, text="Share via ngrok", command=self.share)
         self.btn_stop = ttk.Button(btns, text="Stop sharing", command=self.stop, state="disabled")
-        for b in (self.btn_check, self.btn_share, self.btn_stop):
+        self.btn_stop_all = ttk.Button(btns, text="Stop all", command=self.stop_all, state="disabled")
+        for b in (self.btn_check, self.btn_share, self.btn_stop, self.btn_stop_all):
             b.pack(side="left", padx=(0, 4))
 
         urlf = ttk.LabelFrame(right, text="Public URL", padding=6)
@@ -404,9 +412,30 @@ class App(tk.Tk):
             if needle and needle not in v.site.lower():
                 continue
             ports = ",".join(map(str, v.ports)) + (" (80->443)" if v.http_redirects else "")
-            self.tree.insert("", "end", iid=v.site, values=(v.site, ports, local.get(v.site, ""), v.target))
+            self.tree.insert("", "end", iid=v.site, values=(v.site, ports, local.get(v.site, ""), self._shared_text(v.site), v.target))
         if prev and self.tree.exists(prev[0]):
             self.tree.selection_set(prev[0])
+
+    def _shared_text(self, site):
+        s = self.sessions.get(site)
+        return "" if not s else (s.url or "starting...")
+
+    def _update_site(self, site):
+        """Refresh one site's Shared cell, the panel and the button states after a share changes."""
+        if self.tree.exists(site):
+            self.tree.set(site, "shared", self._shared_text(site))
+        self._refresh_panel()
+
+    def _refresh_panel(self):
+        v = self._selected()
+        s = self.sessions.get(v.site) if v else None
+        self.public_url.set(s.url or "" if s else "")
+        busy = bool(v) and (v.site in self.pending or s is not None)
+        self.btn_share.configure(state="disabled" if busy or not v else "normal")
+        self.btn_stop.configure(state="normal" if s else "disabled")
+        for b in (self.btn_copy, self.btn_open, self.btn_verify):
+            b.configure(state="normal" if s and s.url else "disabled")
+        self.btn_stop_all.configure(state="normal" if self.sessions else "disabled")
 
     def _on_select(self):
         v = self._selected()
@@ -414,7 +443,9 @@ class App(tk.Tk):
             return
         self.sel_label.configure(text=v.site)
         self.sel_detail.configure(text=f"{v.conf}\n{v.target}")
-        self.scheme.set("https" if v.http_redirects or 80 not in v.ports else "http")
+        s = self.sessions.get(v.site)
+        self.scheme.set(s.scheme if s else "https" if v.http_redirects or 80 not in v.ports else "http")
+        self._refresh_panel()
 
     # -- actions -------------------------------------------------------------------------------
 
@@ -444,14 +475,14 @@ class App(tk.Tk):
             icon="warning",
         ):
             return
-        if self.session:
-            self.stop()
+        if v.site in self.sessions or v.site in self.pending:
+            return
 
         scheme = self.scheme.get()
-        self.public_url.set("")
+        self.pending.add(v.site)
         self._log(f"> local check before sharing: {scheme}://127.0.0.1  Host: {v.site}")
         self.status.set(f"Checking {v.site} locally...")
-        self.btn_share.configure(state="disabled")
+        self._refresh_panel()
 
         def work():
             p = probe(v.site, scheme, dial_host="127.0.0.1")
@@ -462,39 +493,51 @@ class App(tk.Tk):
 
     def _ev_start(self, payload):
         site, scheme, local = payload
+        self.pending.discard(site)
         if local.error and not messagebox.askyesno(
             "Local check failed", f"{site} doesn't answer locally:\n{local.error}\n\nStart ngrok anyway?"
         ):
-            self.btn_share.configure(state="normal")
-            self.status.set("Not shared.")
+            self.status.set(f"{site} not shared.")
+            self._refresh_panel()
             return
         try:
-            self.session = NgrokSession(self.ngrok, site, scheme, self.post)
+            s = NgrokSession(self.ngrok, site, scheme, self.post)
         except OSError as e:
-            self.btn_share.configure(state="normal")
+            self._refresh_panel()
             messagebox.showerror("Couldn't start ngrok", str(e))
             return
-        self._log("> " + " ".join(self.session.cmd))
+        self.sessions[site] = s
+        self._log("> " + " ".join(s.cmd))
         self.status.set(f"Starting ngrok for {site}...")
-        self.btn_stop.configure(state="normal")
-        self.btn_share.configure(state="normal")
+        self._update_site(site)
 
     def stop(self):
-        s, self.session = self.session, None
-        if s:
-            self._log(f"> stopping ngrok for {s.vhost}")
-            s.stop()
-        self.public_url.set("")
-        for b in (self.btn_stop, self.btn_copy, self.btn_open, self.btn_verify):
-            b.configure(state="disabled")
-        self.status.set("Not sharing.")
+        v = self._selected()
+        if v:
+            self._stop_site(v.site)
 
-    def verify(self):
-        s, url = self.session, self.public_url.get()
-        if not (s and url):
+    def stop_all(self):
+        for site in list(self.sessions):
+            self._stop_site(site)
+
+    def _stop_site(self, site):
+        s = self.sessions.pop(site, None)
+        if not s:
             return
+        self._log(f"> stopping ngrok for {site}")
+        s.stop()
+        self._update_site(site)
+        self.status.set(f"Stopped sharing {site}. {len(self.sessions)} still shared.")
+
+    def verify(self, s=None):
+        if s is None:
+            v = self._selected()
+            s = self.sessions.get(v.site) if v else None
+        if not (s and s.url):
+            return
+        url = s.url
         host = urlsplit(url).hostname
-        self._log(f"> verifying {url}")
+        self._log(f"> verifying {s.vhost}: {url}")
 
         def work():
             pub = probe(host, "https", headers={"ngrok-skip-browser-warning": "1"})
@@ -509,8 +552,8 @@ class App(tk.Tk):
         self.status.set("URL copied.")
 
     def _on_close(self):
-        if self.session:
-            self.session.stop()
+        for s in self.sessions.values():
+            s.stop()
         self.destroy()
 
     # -- events from worker threads ------------------------------------------------------------
@@ -532,19 +575,17 @@ class App(tk.Tk):
 
     def _ev_url(self, payload):
         s, url = payload
-        if s is not self.session:
+        if self.sessions.get(s.vhost) is not s:
             return
-        self.public_url.set(url)
-        for b in (self.btn_copy, self.btn_open, self.btn_verify):
-            b.configure(state="normal")
+        self._update_site(s.vhost)
         self.status.set(f"{s.vhost} is online at {url}")
-        self.verify()
+        self.verify(s)
 
     def _ev_verified(self, payload):
         s, url, loc, pub = payload
-        if s is not self.session:
+        if self.sessions.get(s.vhost) is not s:
             return
-        self._log(f"  public: {pub.summary()}")
+        self._log(f"  {s.vhost} public: {pub.summary()}")
         if not pub.error:
             self._log(f"  title: {pub.title or '-'}   body: {snippet(pub.body)!r}")
         if pub.error:
@@ -559,19 +600,21 @@ class App(tk.Tk):
             verdict = f"OK: public {pub.status} matches local {loc.status}" + ("" if same_title else " (titles differ)")
         if pub.location and urlsplit(pub.location).hostname not in (None, urlsplit(url).hostname):
             verdict += f"  [redirects to {pub.location} - the app has its own base URL]"
-        self._log("  => " + verdict)
-        self.status.set(verdict)
+        self._log(f"  => {s.vhost}: {verdict}")
+        self.status.set(f"{s.vhost}: {verdict}")
 
     def _ev_exited(self, payload):
         s, code = payload
-        msg = f"ngrok for {s.vhost} exited (code {code})" + (f": {s.last_error}" if s.last_error else "")
+        if s.stopping:  # our own Stop; Windows reports exit code 1 for a terminated process
+            self._log(f"  ngrok for {s.vhost} stopped.")
+            return
+        msg = f"ngrok for {s.vhost} exited unexpectedly (code {code})" + (f": {s.last_error}" if s.last_error else "")
         self._log("  " + msg)
-        if s is self.session:
-            self.session = None
-            self.stop()
-            self.status.set(msg)
-            if code not in (0, 1) or s.last_error:
-                messagebox.showerror("ngrok stopped", msg)
+        if self.sessions.get(s.vhost) is s:
+            del self.sessions[s.vhost]
+            self._update_site(s.vhost)
+        self.status.set(msg)
+        messagebox.showerror("ngrok stopped", msg)
 
 
 if __name__ == "__main__":

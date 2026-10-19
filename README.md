@@ -19,9 +19,10 @@ Single file, Python standard library only (Tkinter).
 - Reads the public URL from ngrok's JSON log (falling back to that agent's own
   `/api/tunnels`), requests it and compares it with the local response. It reports ngrok error
   pages (e.g. `ERR_NGROK_8012`) and apps that redirect to their local `.ic`/`.test` base URL.
-- **Stop sharing** or closing the window stops ngrok.
-
-One share runs at a time: free ngrok accounts get a single dev domain.
+- Several vhosts can be shared at once. Each share is its own ngrok agent with its own public
+  URL, shown in the **Shared** column.
+- **Stop sharing** stops only the selected vhost's share; **Stop all** or closing the window
+  stops every share the app started. ngrok processes started outside the app are never touched.
 
 No auth, rate limiting or traffic policy is added. Vhosts whose names look like database/admin
 tools (`*-db`, `adminer`, `phpmyadmin`, …) ask for confirmation before being made public.
