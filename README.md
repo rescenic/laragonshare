@@ -1,5 +1,7 @@
 # Laragon → ngrok
 
+<img width="1002" height="712" alt="image" src="https://github.com/user-attachments/assets/023de5b1-3c22-4af8-b2e5-fbf46a58f2f1" />
+
 A small Windows GUI that lists the Apache vhosts from Laragon's `sites-enabled` folder and shares
 the one you pick through an [ngrok](https://ngrok.com) agent endpoint, then checks that the public
 URL really serves the same page as the local site.
