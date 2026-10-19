@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# PyInstaller output (rebuild with the command in README.md)
+build/
+dist/
+*.spec
+
+# ngrok binary and config: the config holds the authtoken, never commit it
+ngrok.exe
+ngrok.yml
+*.log
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
