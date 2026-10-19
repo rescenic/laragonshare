@@ -19,6 +19,7 @@ Single file, Python standard library only (Tkinter).
 - Reads the public URL from ngrok's JSON log (falling back to that agent's own
   `/api/tunnels`), requests it and compares it with the local response. It reports ngrok error
   pages (e.g. `ERR_NGROK_8012`) and apps that redirect to their local `.ic`/`.test` base URL.
+- **Rewrite links** (on by default) – see [Link rewriting](#link-rewriting).
 - Several vhosts can be shared at once. Each share is its own ngrok agent with its own public
   URL, shown in the **Shared** column.
 - **Stop sharing** stops only the selected vhost's share; **Stop all** or closing the window
@@ -26,6 +27,27 @@ Single file, Python standard library only (Tkinter).
 
 No auth, rate limiting or traffic policy is added. Vhosts whose names look like database/admin
 tools (`*-db`, `adminer`, `phpmyadmin`, …) ask for confirmation before being made public.
+
+## Link rewriting
+
+Many apps build absolute URLs from a configured base URL (CodeIgniter `base_url`, WordPress
+`siteurl`, Laravel `APP_URL`, ...), so menus on the public page still point at `http://<site>.ic/`.
+With **Rewrite links** on, ngrok forwards to a small proxy inside the app
+(`ngrok http http://127.0.0.1:<random port>`) instead of straight to Apache. The proxy:
+
+- sends the request to Apache on 127.0.0.1 as the vhost (Host header, and SNI for HTTPS)
+- replaces `http(s)://<vhost>`, `//<vhost>`, JSON-escaped `http:\/\/<vhost>` and URL-encoded
+  `http%3A%2F%2F<vhost>` with the public URL in HTML, CSS, JS, JSON, XML and SVG responses, and
+  in `Location`, `Content-Location`, `Refresh` and `Link` headers
+- drops `Domain=<vhost>` from cookies so the browser keeps them on the public host
+- maps the public origin in `Origin` / `Referer` back to the vhost, so CSRF/origin checks pass
+- sets `X-Forwarded-Host` to the public host
+
+Limits: binary files pass through untouched, responses that Apache compresses anyway aren't
+rewritten, bare hostnames without a scheme or `//` are left alone, and WebSockets aren't
+proxied. For a WebSocket app, untick the option, or set the app's base URL from the request
+host instead (e.g. derive CodeIgniter's `base_url` from `$_SERVER['HTTP_X_FORWARDED_HOST'] ??
+$_SERVER['HTTP_HOST']`).
 
 ## Requirements
 
@@ -68,7 +90,7 @@ of `--onefile` for faster startup and fewer false positives.
 | --- | --- |
 | `ERR_NGROK_8012` on the public URL | ngrok can't reach Apache: Apache stopped, or wrong upstream (try the other HTTP/HTTPS option). |
 | `ERR_NGROK_334` / endpoint already online | Another ngrok agent is already using your dev domain. Stop it first. |
-| Public URL redirects to `http://<site>.ic/...` | The app has its own base URL (e.g. WordPress `siteurl`, Laravel `APP_URL`). |
+| Public page links or redirects to `http://<site>.ic/...` | The app has its own base URL. Share with **Rewrite links** on; the log reports any links still left. |
 | Local check returns 503 | The vhost proxies to a backend (e.g. a Node app) that isn't running. |
 | ngrok keeps running after a crash | `taskkill /IM ngrok.exe /F` (stops every ngrok process). |
 

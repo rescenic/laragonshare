@@ -2,12 +2,15 @@
 
 Lists the Apache vhosts in Laragon's sites-enabled folder and shares the selected one through an
 ngrok agent endpoint (`ngrok http 80 --host-header=<vhost>`), then checks the public URL against
-the local response.
+the local response. Optionally a built-in proxy sits between ngrok and Apache and rewrites the
+site's own absolute links (http://<vhost>/...) to the public URL.
 
 Standard library only. Run with:  pythonw laragon_share.py  [sites-enabled dir]
 """
 
+import gzip
 import http.client
+import http.server
 import json
 import os
 import queue
@@ -94,6 +97,19 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._ctx.wrap_socket(sock, server_hostname=self.host)
 
 
+APACHE_PORTS = {"http": 80, "https": 443}
+
+
+def upstream_conn(vhost, scheme, timeout):
+    """Connection to Apache on 127.0.0.1 that presents itself as the vhost (SNI for https)."""
+    port = APACHE_PORTS[scheme]
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # Laragon's self-signed cert
+        return _PinnedHTTPSConnection(vhost, port, "127.0.0.1", ctx, timeout=timeout)
+    return http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+
+
 @dataclass
 class Probe:
     status: int = 0
@@ -114,19 +130,15 @@ class Probe:
 
 
 def probe(host, scheme, dial_host=None, headers=None):
-    """GET / without following redirects. dial_host pins the TCP target (local checks)."""
-    port = 443 if scheme == "https" else 80
+    """GET / without following redirects. With dial_host the request goes to local Apache as `host`."""
     hdrs = {"Host": host, "User-Agent": "laragon-share/1.0", "Accept": "*/*", **(headers or {})}
     try:
-        if scheme == "https":
-            ctx = ssl.create_default_context()
-            if dial_host:  # Laragon's self-signed cert
-                ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
-                conn = _PinnedHTTPSConnection(host, port, dial_host, ctx, timeout=TIMEOUT)
-            else:
-                conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=TIMEOUT)
+        if dial_host:
+            conn = upstream_conn(host, scheme, TIMEOUT)
+        elif scheme == "https":
+            conn = http.client.HTTPSConnection(host, 443, context=ssl.create_default_context(), timeout=TIMEOUT)
         else:
-            conn = http.client.HTTPConnection(dial_host or host, port, timeout=TIMEOUT)
+            conn = http.client.HTTPConnection(host, 80, timeout=TIMEOUT)
         conn.request("GET", "/", headers=hdrs)
         resp = conn.getresponse()
         raw = resp.read(64 * 1024)
@@ -149,6 +161,158 @@ def probe(host, scheme, dial_host=None, headers=None):
 
 def snippet(text, n=240):
     return re.sub(r"\s+", " ", text).strip()[:n]
+
+
+# ---------------------------------------------------------------------------------------------
+# Link-rewriting proxy (ngrok -> this proxy -> Apache)
+# ---------------------------------------------------------------------------------------------
+
+HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection",
+              "te", "trailer", "trailers", "transfer-encoding", "upgrade"}
+REWRITE_TYPES = re.compile(r"text/|json|javascript|xml|svg|manifest", re.I)
+MAX_REWRITE_BYTES = 32 * 1024 * 1024
+
+
+class LinkRewriter:
+    """Maps the vhost's absolute URLs to the public ngrok URL in responses, and the public origin
+    back to the vhost in request headers (so Origin/Referer checks still pass)."""
+
+    def __init__(self, vhost, scheme):
+        self.vhost, self.scheme = vhost, scheme
+        self.public_host = None
+        self._rules = []
+
+    def set_public(self, url):
+        pub = urlsplit(url).hostname.encode()
+        host = re.escape(self.vhost.encode())
+        tail = rb"(?::(?:80|443))?(?![\w.-])"  # not a longer hostname such as <vhost>.example
+        self._rules = [
+            (re.compile(rb"https?://" + host + tail, re.I), b"https://" + pub),
+            (re.compile(rb"https?:\\/\\/" + host + tail, re.I), b"https:\\/\\/" + pub),      # JSON-escaped
+            (re.compile(rb"https?%3A%2F%2F" + host + tail, re.I), b"https%3A%2F%2F" + pub),  # URL-encoded
+            (re.compile(rb"//" + host + tail, re.I), b"//" + pub),                           # protocol-relative
+            (re.compile(rb"\\/\\/" + host + tail, re.I), b"\\/\\/" + pub),
+        ]
+        self._back = re.compile(r"https?://" + re.escape(pub.decode()) + r"(?![\w.-])", re.I)
+        self.public_host = pub.decode()
+
+    def to_public(self, data):
+        for pattern, repl in self._rules:
+            data = pattern.sub(lambda _m, r=repl: r, data)
+        return data
+
+    def to_public_str(self, text):
+        return self.to_public(text.encode("latin-1")).decode("latin-1")
+
+    def to_local(self, text):
+        return self._back.sub(f"{self.scheme}://{self.vhost}", text) if self.public_host else text
+
+    def strip_cookie_domain(self, cookie):
+        return re.sub(r";\s*domain=\.?" + re.escape(self.vhost) + r"\s*(?=;|$)", "", cookie, flags=re.I)
+
+
+class _ProxyHandler(http.server.BaseHTTPRequestHandler):
+    # HTTP/1.0: one request per connection, so bodies of unknown length can simply run to EOF.
+    server_version = "laragon-share"
+
+    def log_message(self, *args):
+        pass
+
+    def do_proxy(self):
+        px = self.server.px
+        rw = px.rewriter
+        try:
+            body = self._request_body()
+            conn = upstream_conn(px.vhost, px.scheme, timeout=300)
+            conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", px.vhost)
+            for k, v in self.headers.items():
+                lk = k.lower()
+                # Accept-Encoding is dropped so Apache answers uncompressed and the body can be rewritten.
+                if lk in HOP_BY_HOP or lk in ("host", "accept-encoding", "content-length"):
+                    continue
+                if lk in ("origin", "referer"):
+                    v = rw.to_local(v)
+                conn.putheader(k, v)
+            if rw.public_host and "X-Forwarded-Host" not in self.headers:
+                conn.putheader("X-Forwarded-Host", rw.public_host)
+            if body is not None:
+                conn.putheader("Content-Length", str(len(body)))
+            conn.endheaders(body)
+            resp = conn.getresponse()
+        except Exception as e:  # noqa: BLE001
+            self.send_error(502, f"Laragon upstream unreachable: {e}")
+            return
+        try:
+            self._relay(resp, rw)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        finally:
+            conn.close()
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_proxy
+
+    def _request_body(self):
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            chunks = []
+            while size := int(self.rfile.readline().split(b";")[0].strip() or b"0", 16):
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline()
+            while self.rfile.readline().strip():  # trailers
+                pass
+            return b"".join(chunks)
+        length = self.headers.get("Content-Length")
+        return self.rfile.read(int(length)) if length is not None else None
+
+    def _relay(self, resp, rw):
+        ctype = resp.getheader("Content-Type", "")
+        encoding = (resp.getheader("Content-Encoding") or "identity").lower()
+        rewrite = (rw.public_host and self.command != "HEAD" and resp.status not in (204, 304)
+                   and REWRITE_TYPES.search(ctype) and encoding == "identity"
+                   and int(resp.getheader("Content-Length") or 0) <= MAX_REWRITE_BYTES)
+
+        self.send_response_only(resp.status, resp.reason)
+        for k, v in resp.getheaders():
+            lk = k.lower()
+            if lk in HOP_BY_HOP or (rewrite and lk == "content-length"):
+                continue
+            if rw.public_host and lk in ("location", "content-location", "refresh", "link"):
+                v = rw.to_public_str(v)
+            elif lk == "set-cookie":
+                v = rw.strip_cookie_domain(v)
+            self.send_header(k, v)
+
+        if rewrite:
+            data = rw.to_public(resp.read())
+            if len(data) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
+                data = gzip.compress(data, 6)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self.end_headers()
+            if self.command != "HEAD":
+                while chunk := resp.read(64 * 1024):
+                    self.wfile.write(chunk)
+        self.close_connection = True
+
+
+class RewriteProxy:
+    """Local HTTP proxy on 127.0.0.1:<random port> that forwards to Apache as the vhost."""
+
+    def __init__(self, vhost, scheme):
+        self.vhost, self.scheme = vhost, scheme
+        self.rewriter = LinkRewriter(vhost, scheme)
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+        self.httpd.px = self
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def stop(self):
+        # shutdown() waits for the serve loop, so keep it off the UI thread.
+        threading.Thread(target=lambda: (self.httpd.shutdown(), self.httpd.server_close()), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -175,18 +339,28 @@ def ngrok_version(exe):
 class NgrokSession:
     """One `ngrok http` agent process for one vhost. Each share runs its own agent, so they stop independently."""
 
-    def __init__(self, exe, vhost, scheme, post):
-        self.vhost, self.scheme, self.post = vhost, scheme, post
-        upstream = "80" if scheme == "http" else f"https://{vhost}:443"
-        self.cmd = [exe, "http", upstream, f"--host-header={vhost}", "--log", "stdout", "--log-format", "json"]
+    def __init__(self, exe, vhost, scheme, rewrite, post):
+        self.vhost, self.scheme, self.rewrite, self.post = vhost, scheme, rewrite, post
+        self.proxy = RewriteProxy(vhost, scheme) if rewrite else None
+        if self.proxy:
+            # The proxy sets the Host header and speaks http/https to Apache itself.
+            upstream = [f"http://127.0.0.1:{self.proxy.port}"]
+        else:
+            upstream = ["80" if scheme == "http" else f"https://{vhost}:443", f"--host-header={vhost}"]
+        self.cmd = [exe, "http", *upstream, "--log", "stdout", "--log-format", "json"]
         self.url = None
         self.web_addr = None
         self.last_error = ""
         self.stopping = False  # set by stop(), so the exit that follows isn't reported as a failure
-        self.proc = subprocess.Popen(
-            self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+            )
+        except OSError:
+            if self.proxy:
+                self.proxy.stop()
+            raise
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._api_fallback, daemon=True).start()
 
@@ -204,7 +378,17 @@ class NgrokSession:
                 continue
             self._handle(rec)
         code = self.proc.wait()
+        if self.proxy:
+            self.proxy.stop()
         self.post("exited", (self, code))
+
+    def _got_url(self, url):
+        if self.url:
+            return
+        if self.proxy:
+            self.proxy.rewriter.set_public(url)
+        self.url = url
+        self.post("url", (self, url))
 
     def _handle(self, rec):
         # Never surface anything token-like, even if a future ngrok version logs it.
@@ -218,9 +402,8 @@ class NgrokSession:
         if msg == "starting web service" and rec.get("addr"):
             self.web_addr = rec["addr"]
         url = rec.get("url")
-        if isinstance(url, str) and url.startswith("https://") and not self.url:
-            self.url = url
-            self.post("url", (self, url))
+        if isinstance(url, str) and url.startswith("https://"):
+            self._got_url(url)
         extras = " ".join(f"{k}={v}" for k, v in rec.items() if k not in ("obj", "pg", "id") and v is not None)
         self.post("log", f"[{self.vhost}] [{lvl}] {msg} {extras}".rstrip())
 
@@ -238,9 +421,8 @@ class NgrokSession:
             except Exception:  # noqa: BLE001
                 continue
             for t in tunnels:
-                if str(t.get("public_url", "")).startswith("https://") and not self.url:
-                    self.url = t["public_url"]
-                    self.post("url", (self, self.url))
+                if str(t.get("public_url", "")).startswith("https://"):
+                    self._got_url(t["public_url"])
                     return
 
     def stop(self):
@@ -272,6 +454,7 @@ class App(tk.Tk):
         self.sites_dir = tk.StringVar(value=sites_dir)
         self.filter = tk.StringVar()
         self.scheme = tk.StringVar(value="http")
+        self.rewrite = tk.BooleanVar(value=True)
         self.public_url = tk.StringVar()
         self.status = tk.StringVar(value="Pick a vhost.")
 
@@ -324,6 +507,8 @@ class App(tk.Tk):
         up.pack(fill="x")
         ttk.Radiobutton(up, text="HTTP  (ngrok http 80 --host-header=...)", variable=self.scheme, value="http").pack(anchor="w")
         ttk.Radiobutton(up, text="HTTPS (ngrok http https://<vhost>:443 ...)", variable=self.scheme, value="https").pack(anchor="w")
+        ttk.Checkbutton(up, text="Rewrite links to <vhost> to the public URL (built-in proxy)",
+                        variable=self.rewrite).pack(anchor="w", pady=(4, 0))
 
         btns = ttk.Frame(right)
         btns.pack(fill="x", pady=8)
@@ -445,6 +630,8 @@ class App(tk.Tk):
         self.sel_detail.configure(text=f"{v.conf}\n{v.target}")
         s = self.sessions.get(v.site)
         self.scheme.set(s.scheme if s else "https" if v.http_redirects or 80 not in v.ports else "http")
+        if s:
+            self.rewrite.set(s.rewrite)
         self._refresh_panel()
 
     # -- actions -------------------------------------------------------------------------------
@@ -478,7 +665,7 @@ class App(tk.Tk):
         if v.site in self.sessions or v.site in self.pending:
             return
 
-        scheme = self.scheme.get()
+        scheme, rewrite = self.scheme.get(), self.rewrite.get()
         self.pending.add(v.site)
         self._log(f"> local check before sharing: {scheme}://127.0.0.1  Host: {v.site}")
         self.status.set(f"Checking {v.site} locally...")
@@ -487,12 +674,12 @@ class App(tk.Tk):
         def work():
             p = probe(v.site, scheme, dial_host="127.0.0.1")
             self.post("local", (v.site, scheme, p))
-            self.post("start", (v.site, scheme, p))
+            self.post("start", (v.site, scheme, rewrite, p))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _ev_start(self, payload):
-        site, scheme, local = payload
+        site, scheme, rewrite, local = payload
         self.pending.discard(site)
         if local.error and not messagebox.askyesno(
             "Local check failed", f"{site} doesn't answer locally:\n{local.error}\n\nStart ngrok anyway?"
@@ -501,12 +688,14 @@ class App(tk.Tk):
             self._refresh_panel()
             return
         try:
-            s = NgrokSession(self.ngrok, site, scheme, self.post)
+            s = NgrokSession(self.ngrok, site, scheme, rewrite, self.post)
         except OSError as e:
             self._refresh_panel()
             messagebox.showerror("Couldn't start ngrok", str(e))
             return
         self.sessions[site] = s
+        if s.proxy:
+            self._log(f"> link-rewriting proxy 127.0.0.1:{s.proxy.port} -> {scheme}://{site} (Apache)")
         self._log("> " + " ".join(s.cmd))
         self.status.set(f"Starting ngrok for {site}...")
         self._update_site(site)
@@ -600,6 +789,10 @@ class App(tk.Tk):
             verdict = f"OK: public {pub.status} matches local {loc.status}" + ("" if same_title else " (titles differ)")
         if pub.location and urlsplit(pub.location).hostname not in (None, urlsplit(url).hostname):
             verdict += f"  [redirects to {pub.location} - the app has its own base URL]"
+        left = len(re.findall(r"(?://|\\/\\/)" + re.escape(s.vhost) + r"(?![\w.-])", pub.body))
+        if left:
+            fix = "rewritten only in text responses" if s.rewrite else "share again with link rewriting on"
+            verdict += f"  [{left} link(s) to {s.vhost} on the page - {fix}]"
         self._log(f"  => {s.vhost}: {verdict}")
         self.status.set(f"{s.vhost}: {verdict}")
 
